@@ -1,4 +1,7 @@
-"""This script acts as a filter to all requests for files within this
+"""
+TAAC - TAAC Ain't Access Control (or TAMI Accountability/Access Control) Proxy
+
+This script acts as a filter to all requests for files within this
 directory.  If a file is associated with a policy in policies.n3, it will
 send a 401 error asking for AIR-based authentication.
 
@@ -9,6 +12,8 @@ to operate."""
 import os
 import os.path
 import re
+import string
+from random import choice
 
 import sys
 import traceback
@@ -23,6 +28,7 @@ from tmswap import llyn
 from tmswap import myStore
 from tmswap.RDFSink import SUBJ, OBJ
 from tmswap import uripath
+from tmswap import policyrunner
 
 # Some globals...  You shouldn't need to change these...
 POLICY_FILE = './policies.n3'
@@ -253,6 +259,103 @@ def get_auth_header(req):
     
     return header
 
+# Some request conditions...
+# 1:15
+REQ_NO_ID        = 0
+REQ_NO_AUTH      = 1
+REQ_INCOMPLETE   = 2
+REQ_AUTH_FAILED  = 3
+REQ_AUTH_SUCCESS = 4
+LOG_URI = 'http://www.pipian.com/rdf/tami/log.n3'
+LOG_FILE = './log.n3'
+RDF_A = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'
+REIN_REQUEST = REIN_URI + 'Request'
+TAMI_URI = 'http://dig.csail.mit.edu/TAMI/2007/tami#'
+TAMI_DATA = TAMI_URI + 'data'
+TAMI_RECIPIENT = TAMI_URI + 'recipient'
+REIN_STATUS = REIN_URI + 'status'
+ACCESS_ID_LEN = 32
+def log_request(requested_uri, identity, error):
+    """Adds the record of a request to the log and returns a formula for
+    processing."""
+
+    # TODO: Clean up, and actually log.
+    # Init the store.
+    store = llyn.RDFStore()
+    myStore.setStore(store)
+
+    # TODO: Find out if random id is assigned already in the log.
+    chars = string.letters + string.digits
+    rand_str = ''
+    for i in range(ACCESS_ID_LEN):
+        rand_str = rand_str + choice(chars)
+
+    context = store.newFormula()
+    entry = context.newSymbol(LOG_URI + '#' + rand_str)
+    a = context.newSymbol(RDF_A)
+    request = context.newSymbol(REIN_REQUEST)
+    data = context.newSymbol(TAMI_DATA)
+    recipient = context.newSymbol(TAMI_RECIPIENT)
+    status = context.newSymbol(REIN_STATUS)
+    if error == REQ_NO_ID:
+        status_descriptor = REIN_URI + 'status_no_id'
+    elif error == REQ_NO_AUTH:
+        status_descriptor = REIN_URI + 'status_no_auth'
+    elif error == REQ_INCOMPLETE:
+        status_descriptor = REIN_URI + 'status_incomplete'
+    elif error == REQ_AUTH_FAILED:
+        status_descriptor = REIN_URI + 'status_auth_failed'
+    elif error == REQ_AUTH_SUCCESS:
+        status_descriptor = REIN_URI + 'status_auth_success'
+    status_descriptor = context.newSymbol(status_descriptor)
+    context.add(entry, a, request)
+    context.add(entry, data, context.newSymbol(requested_uri))
+    if identity != None:
+        context.add(entry, recipient, context.newSymbol(identity))
+#        context.add(context.newSymbol(identity), a, government_official)
+    context.add(entry, status, status_descriptor)
+
+    log = open(LOG_FILE, 'a')
+    # Initialize the log if needed.
+#    if log.tell() == 0:
+#        log.write("@prefix : <%> .\n" % (LOG_URI + '#'))
+#        log.write("@prefix tami: <http://dig.csail.mit.edu/TAMI/2007/tami#> .\n")
+#        log.write("@prefix rein: <http://dig.csail.mit.edu/2005/09/rein/network#> .\n")
+#        log.write("\n")
+    entry = context.n3String(flags = 'p').split("\n")
+    # Strip @-directives when writing the n3String.
+    for line in entry:
+        line = line.strip() + "\n"
+#        if len(line) > 0 and line[0] == '@':
+#            continue
+        log.write(line)
+    log.close()
+#    apache.log_error(context.n3String(), apache.APLOG_ERR)
+
+    return context
+
+COMPLETE_ACC_DENIED  = 0
+COMPLETE_ACC_GRANTED = 1
+def log_completed_request(requested_uri, conclusions, error):
+    """Adds the record of a completed request to the log."""
+
+    log = open(LOG_FILE, 'a')
+    # Initialize the log if needed.
+#    if log.tell() == 0:
+#        log.write("@prefix : <%> .\n" % (LOG_URI + '#'))
+#        log.write("@prefix tami: <http://dig.csail.mit.edu/TAMI/2007/tami#> .\n")
+#        log.write("@prefix rein: <http://dig.csail.mit.edu/2005/09/rein/network#> .\n")
+#        log.write("\n")
+    entry = conclusions.n3String(flags = 'p').split("\n")
+    # Strip @-directives when writing the n3String.
+    for line in entry:
+        line = line.strip() + "\n"
+#        if len(line) > 0 and line[0] == '@':
+#            continue
+        log.write(line)
+    log.close()
+#    apache.log_error(context.n3String(), apache.APLOG_ERR)
+
 def transhandler(req):
     global REWRITE_RE, SCRIPT_INT_PATH
     
@@ -325,6 +428,7 @@ def accesshandler(req):
     
     # Does the requested file exist?
     if not os.path.exists(requested_file):
+        # TODO: Do we want to log this event?
         return apache.HTTP_NOT_FOUND
 #        file_not_found(req, os.path.join(SCRIPT_INT_PATH, requested_file))
 #        return apache.OK
@@ -344,6 +448,8 @@ def accesshandler(req):
                 or not auth_header.params.has_key('identity-document')):
             # No Authorization or identity proffered?  Then send the 401.
             request_authentication(req, policies[requested_uri])
+            # Log this request with no identity.
+            log_request(requested_uri, None, REQ_NO_ID)
             return apache.DONE
         else:
             # Otherwise, we need to check that the identity satisfies the
@@ -396,6 +502,8 @@ def accesshandler(req):
                 # If we don't find it, return a 401.
                 if authid == None:
                     request_authentication(req, policies[requested_uri])
+                    # Log this request, but note no openid.
+                    log_request(requested_uri, identity.document, REQ_NO_AUTH)
                     return apache.DONE
                 
                 # Save the openid server...
@@ -407,11 +515,14 @@ def accesshandler(req):
                 auth_req = openid.begin(authid)
                 redir = auth_req.redirectURL(requested_uri,
                                              requested_uri)
+
+                # Log this request, but note incomplete
+                log_request(requested_uri, identity.document, REQ_INCOMPLETE)
                 
                 # We actually die here, redirecting to the OpenID server.
                 req.headers_out['location'] = redir
-                req.status = apache.HTTP_MOVED_TEMPORARILY
-                return apache.DONE
+#                req.status = apache.HTTP_MOVED_TEMPORARILY
+                return apache.HTTP_MOVED_TEMPORARILY
             else:
                 # We have a continuation of an OpenID authentication.
                 # TODO: Reason over the authorized ID.
@@ -423,6 +534,7 @@ def accesshandler(req):
                 if openid_resp.status != SUCCESS:
                     # If the identity refuses to authenticate, return a 401.
                     request_authentication(req, policies[requested_uri])
+                    log_request(requested_uri, identity.document, REQ_AUTH_FAILED)
                     return apache.DONE
                 
                 if policies[requested_uri].has_key('use_policy'):
@@ -432,9 +544,28 @@ def accesshandler(req):
                 # For now, fall through and don't reason over the policy and
                 # identity.
                 # 3. Run the AIR Reasoner over the policy and identity.
+                req_context = log_request(requested_uri, identity.document, REQ_AUTH_SUCCESS)
+                testPolicy = policyrunner.testPolicy
+                conclusion = testPolicy(
+                    [uripath.splitFrag(identity.document)[0]],
+                    [uripath.splitFrag(policies[requested_uri]['access_policy'])[0]],
+                    req_context.n3String())
                 
                 # 4. Make the return based on what the reasoner concluded.
-            
+
+                AIR_COMPLIANT = 'http://dig.csail.mit.edu/TAMI/2007/amord/air#compliant-with'
+                compliance = conclusion.any(pred=conclusion.newSymbol(AIR_COMPLIANT),
+                                            obj=conclusion.newSymbol(policies[requested_uri]['access_policy']))
+                
+                # If compliance is not explicit, then it's not.
+                if compliance == None:
+                    # Log access denied.
+                    log_completed_request(requested_uri, conclusion, COMPLETE_ACC_DENIED)
+                    return apache.HTTP_FORBIDDEN
+                else:
+                    log_completed_request(requested_uri, conclusion, COMPLETE_ACC_GRANTED)
+                    return apache.OK
+    
     # If we're proxying something not covered by a policy, we just let it thru.
     return apache.OK
 
