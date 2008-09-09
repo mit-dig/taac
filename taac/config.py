@@ -7,3 +7,6 @@ POLICY_TYPE = 'text/rdf+n3'
 LOG_FILE = './log.n3'
 DEFAULT_REALM = 'Default Realm'
 OPENID_CACHE_DIRECTORY = './cache'
+SALT = 'TAACServer'
+NONCE_CACHE_FILE = './nonce.cache'
+NONCE_CACHE_DURATION = 3600 # 1 hour.
