@@ -1,4 +1,6 @@
 import re
+import x509
+import asn1
 
 from mod_python import apache
 
@@ -134,4 +136,3 @@ the credentials required.<P>
 """)
     req.write(req.subprocess_env['SERVER_SIGNATURE'])
     req.write('</BODY></HTML>')
-

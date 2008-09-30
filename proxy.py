@@ -8,6 +8,9 @@ send a 401 error asking for AIR-based authentication.
 This gateway requires mod_python with python 2.4 or greater, python-openid, and
 pyCrypto 2.0.1 or greater (for ElGamal support in OpenPGP) to operate."""
 
+# TODO: Internal caching.
+# TODO: Check signature of FOAF file.
+
 # Internal imports...
 import os
 import os.path
@@ -17,6 +20,7 @@ from random import choice
 import md5
 import time
 import urllib2
+from binascii import a2b_hex
 
 import traceback
 import hotshot
@@ -42,6 +46,8 @@ from taac.util import q
 # Had to import my own copy of the uuid module.  2.4 doesn't have it.
 from taac.uuid import uuid1
 import taac.openpgp as openpgp
+import taac.x509 as x509
+import taac.asn1 as asn1
 
 def pdebug(message_debug_level, message):
     level_mapping = { DEBUG_ERROR: apache.APLOG_ERR,
@@ -53,6 +59,30 @@ def pdebug(message_debug_level, message):
 
 def getTimestampFromNonceTuple(a):
     return a[1]['timestamp']
+
+def extractURISubjectAltNames(cert):
+    alt_names = None
+
+    for optfield in cert.optional_fields:
+        if optfield.tag == 3:
+            for ext in optfield.value():
+                if ext[0].value() == (2, 5, 29, 17):
+                    alt_names, rest = asn1.der_decode(ext[1].value())
+                    assert rest == ''
+                if alt_names != None:
+                    break
+            if alt_names != None:
+                break
+
+    if alt_names == None:
+        return []
+
+    alt_names_array = []
+    for alt_name in alt_names:
+        if alt_name.tag == 6:
+            alt_names_array.append(alt_name.value())
+
+    return alt_names_array
 
 class TAACServer:
     def __init__(self, base_uri, base_path):
@@ -225,7 +255,10 @@ class TAACServer:
 #        log.write("@prefix tami: <http://dig.csail.mit.edu/TAMI/2007/tami#> .\n")
 #        log.write("@prefix rein: <http://dig.csail.mit.edu/2005/09/rein/network#> .\n")
 #        log.write("\n")
-        entry = conclusions.n3String(flags = 'p').split("\n")
+        if conclusions != None:
+            entry = conclusions.n3String(flags = 'p').split("\n")
+        else:
+            entry = ''
         # Strip @-directives when writing the n3String.
         for line in entry:
             line = line.strip() + "\n"
@@ -384,12 +417,15 @@ class TAACServer:
         
         # And then query for wot:identity and wot:pubkeyAddress properties for
         # the proffered identity fragid.
-        authid = context.any(subj=context.newSymbol(client.id),
-                             pred=context.newSymbol(
-                                      taac.namespaces.wot.hasKey))
+        authids = context.each(subj=context.newSymbol(client.id),
+                               pred=context.newSymbol(
+                                        taac.namespaces.wot.hasKey))
+        authids.extend(context.each(pred=context.newSymbol(
+                                             taac.namespaces.wot.identity),
+                                    obj=context.newSymbol(client.id)))
         
         # If we don't find it, return a 401.
-        if authid == None:
+        if authids == []:
             pdebug(DEBUG_WARNING,
                    "Couldn't find public key address in identity-document.")
             policy = self.policies[requested_uri]
@@ -402,106 +438,265 @@ class TAACServer:
                    'Requesting authentication: %s' % (auth_header))
             taac.util.request_authentication(req, self.policies[requested_uri])
             
-            # Log this request, but note no openid.
+            # Log this request, but note no public key.
             self.log_request(requested_uri, client.id, taac.util.REQ_NO_AUTH)
             
             return apache.DONE
 
-        pubkey = context.any(subj=authid,
-                             pred=context.newSymbol(
-                                      taac.namespaces.wot.pubkeyAddress))
+        for authid in authids:
+            pubkey = context.any(subj=authid,
+                                 pred=context.newSymbol(
+                                          taac.namespaces.wot.pubkeyAddress))
 
-        pubkey = str(pubkey.uriref())
-
-        pdebug(DEBUG_MESSAGE, 'Public key address: %s' % (pubkey))
-        pdebug(DEBUG_MESSAGE, 'Populating keyring with public key...')
-
-        f = urllib2.urlopen(pubkey)
-        pubkey = f.read()
-        f.close()
-
-        keys = openpgp.parsePGPKeys(pubkey)
-        ring = openpgp.PGPKeyRing()
-        for key in keys:
-            ring.addKey(key)
-
-        # 2. Check the provided signature against the expected message.
-        pdebug(DEBUG_MESSAGE, 'Attempting to verify provided signature...')
-
-        # The message is "(realm):(nonce)"
-        message = realm + ':' + nonce
-
-        # Build the signature ASCII-armored packet from the pure sig.
-        signature = "-----BEGIN PGP SIGNATURE-----\n" + \
-                    "\n" + \
-                    signature + "\n" + \
-                    "-----END PGP SIGNATURE-----\n"
-        
-        signature = openpgp.parsePGPSignature(signature)
-        digest = signature.prepareDigest()
-        digest.update(message)
-        digest = signature.finishDigest(digest)
-        
-        (match, key) = signature.verifyDigest(ring, digest)
-
-        if match == 1:
-            # We good.
-            pdebug(DEBUG_MESSAGE, "Signature matched!")
-            if self.policies[requested_uri].has_key('use_policy'):
-                pdebug(DEBUG_MESSAGE, "Appending associated use policy.")
-                req.headers_out['x-use-policy'] = \
-                    str(self.policies[requested_uri]['use_policy'])
-
-            # 3. Run the AIR Reasoner over the policy and identity.
-            req_context = self.log_request(requested_uri, client.id,
-                                           taac.util.REQ_AUTH_SUCCESS)
-            testPolicy = policyrunner.runPolicy
-            pdebug(DEBUG_MESSAGE, "Reasoning over log and policy.")
-            (conclusion, context) = testPolicy(
-                [uripath.splitFrag(client.id)[0]],
-                [uripath.splitFrag(self.policies[requested_uri]['access_policy'])[0]],
-                req_context.n3String())
+            if pubkey == None:
+                continue
             
-            # 4. Make the return based on what the reasoner concluded.
+            pubkey = str(pubkey.uriref())
             
-            compliance = conclusion.any(
-                pred=conclusion.newSymbol(taac.namespaces.air['compliant-with']),
-                obj=conclusion.newSymbol(self.policies[requested_uri]['access_policy']))
+            pdebug(DEBUG_MESSAGE, 'Public key address: %s' % (pubkey))
+            pdebug(DEBUG_MESSAGE, 'Populating keyring with public key...')
             
-            # If compliance is not explicit, then it's not.
-            if compliance == None:
-                # Log access denied.
-                pdebug(DEBUG_MESSAGE, "Access not compliant with policy.")
-                self.log_completed_request(requested_uri, conclusion,
-                                           taac.util.COMPLETE_ACC_DENIED)
-                return apache.HTTP_FORBIDDEN
+            f = urllib2.urlopen(pubkey)
+            pubkey = f.read()
+            f.close()
+            
+            keys = openpgp.parsePGPKeys(pubkey)
+            ring = openpgp.PGPKeyRing()
+            for key in keys:
+                ring.addKey(key)
+                
+            # 2. Check the provided signature against the expected message.
+            pdebug(DEBUG_MESSAGE, 'Attempting to verify provided signature...')
+            
+            # The message is "(realm):(nonce)"
+            message = realm + ':' + nonce
+            
+            # Build the signature ASCII-armored packet from the pure sig.
+            signature = "-----BEGIN PGP SIGNATURE-----\n" + \
+                        "\n" + \
+                        signature + "\n" + \
+                        "-----END PGP SIGNATURE-----\n"
+            
+            signature = openpgp.parsePGPSignature(signature)
+            digest = signature.prepareDigest()
+            digest.update(message)
+            digest = signature.finishDigest(digest)
+            
+            (match, key) = signature.verifyDigest(ring, digest)
+            
+            if match == 1:
+                # We good.
+                pdebug(DEBUG_MESSAGE, "Signature matched!")
+                if self.policies[requested_uri].has_key('use_policy'):
+                    pdebug(DEBUG_MESSAGE, "Appending associated use policy.")
+                    req.headers_out['x-use-policy'] = \
+                        str(self.policies[requested_uri]['use_policy'])
+                
+                # 3. Run the AIR Reasoner over the policy and identity.
+                req_context = self.log_request(requested_uri, client.id,
+                                               taac.util.REQ_AUTH_SUCCESS)
+                testPolicy = policyrunner.runPolicy
+                pdebug(DEBUG_MESSAGE, "Reasoning over log and policy.")
+                (conclusion, context) = testPolicy(
+                    [uripath.splitFrag(client.id)[0]],
+                    [uripath.splitFrag(self.policies[requested_uri]['access_policy'])[0]],
+                    req_context.n3String())
+                
+                # 4. Make the return based on what the reasoner concluded.
+                
+                compliance = conclusion.any(
+                    pred=conclusion.newSymbol(taac.namespaces.air['compliant-with']),
+                    obj=conclusion.newSymbol(self.policies[requested_uri]['access_policy']))
+                
+                # If compliance is not explicit, then it's not.
+                if compliance == None:
+                    # Log access denied.
+                    pdebug(DEBUG_MESSAGE, "Access not compliant with policy.")
+                    self.log_completed_request(requested_uri, conclusion,
+                                               taac.util.COMPLETE_ACC_DENIED)
+                    return apache.HTTP_FORBIDDEN
+                else:
+                    pdebug(DEBUG_MESSAGE, "Access compliant with policy.")
+                    self.log_completed_request(requested_uri, conclusion,
+                                               taac.util.COMPLETE_ACC_GRANTED)
+                    return apache.OK
             else:
-                pdebug(DEBUG_MESSAGE, "Access compliant with policy.")
-                self.log_completed_request(requested_uri, conclusion,
-                                           taac.util.COMPLETE_ACC_GRANTED)
-                return apache.OK
-        else:
-            # We not good.
-            pdebug(DEBUG_MESSAGE, "Signature didn't match!")
-            pdebug(DEBUG_WARNING, "Client failed to authenticate with RDFAuth.")
+                # We not good.
+                pdebug(DEBUG_MESSAGE, "Signature didn't match!")
+                pdebug(DEBUG_WARNING, "Client failed to authenticate with RDFAuth.")
+                
+                policy = self.policies[requested_uri]
+                nonce = self.issue_nonce(q(policy['realm']))
+                auth_header = 'TAAC realm="%s",policy="%s",nonce="%s"' % \
+                              (q(policy['realm']),
+                               q(policy['access_policy']),
+                               q(nonce))
+                pdebug(DEBUG_MESSAGE,
+                       'Requesting authentication: %s' % (auth_header))
+                taac.util.request_authentication(req, auth_header)
+                
+                self.log_request(requested_uri, client.id,
+                                 taac.util.REQ_AUTH_FAILED)
+                
+                return apache.DONE
+        
+        pdebug(DEBUG_WARNING,
+               "Couldn't find public key address in identity-document.")
+        policy = self.policies[requested_uri]
+        nonce = self.issue_nonce(q(policy['realm']))
+        auth_header = 'TAAC realm="%s",policy="%s",nonce="%s"' % \
+                      (q(policy['realm']),
+                       q(policy['access_policy']),
+                       q(nonce))
+        pdebug(DEBUG_MESSAGE,
+               'Requesting authentication: %s' % (auth_header))
+        taac.util.request_authentication(req, self.policies[requested_uri])
+        
+        # Log this request, but note no public key.
+        self.log_request(requested_uri, client.id, taac.util.REQ_NO_AUTH)
+        
+        return apache.DONE
+    
+    def check_foaf_ssl(self, req, client, requested_uri):
+        # 1.1. Extract URI subjectAltNames from client cert...
+        pdebug(DEBUG_MESSAGE, 'Parsing SSL client cert...')
+        cert = req.subprocess_env['SSL_CLIENT_CERT']
+        cert = "-----BEGIN CERTIFICATE-----\n" + cert + \
+               "\n-----END CERTIFICATE-----\n"
+        cert = x509.certificate.pem_decode(cert)
+
+        pdebug(DEBUG_MESSAGE, 'Searching for subjectAltName extension...')
+        names = extractURISubjectAltNames(cert)
+
+        for name in names:
+            pdebug(DEBUG_MESSAGE, 'Checking URI: %s' % (name))
+
+            # 1.2. Try to get the signature associated with the ident doc.
+            pdebug(DEBUG_MESSAGE, "Trying to get signature from ident doc...")
             
-            policy = self.policies[requested_uri]
-            nonce = self.issue_nonce(q(policy['realm']))
-            auth_header = 'TAAC realm="%s",policy="%s",nonce="%s"' % \
-                          (q(policy['realm']),
-                           q(policy['access_policy']),
-                           q(nonce))
-            pdebug(DEBUG_MESSAGE,
-                   'Requesting authentication: %s' % (auth_header))
-            taac.util.request_authentication(req, auth_header)
+            # Get the document and parse in the RDF graph...
+            if self.store == None:
+                store = llyn.RDFStore()
+                myStore.setStore(store)
+            try:
+                context = self.store.load(uri = uripath.splitFrag(name)[0],
+                                          remember = 0,
+                                          referer = '',
+                                          topLevel = True)
+            except:# (IOError, SyntaxError, DocumentError):
+                # TODO: Actually record an error somewhere.
+                apache.log_error("Unexpected error:" + traceback.format_exc(),
+                                 apache.APLOG_ERR)
+                raise apache.SERVER_RETURN, \
+                      apache.HTTP_INTERNAL_SERVER_ERROR
+            # Currently voodoo magic.
+            # TODO: How does rdflib work ANYWAY?
+            context.reopen()
+            context.stayOpen = 1
             
-            self.log_request(requested_uri, client.id,
-                             taac.util.REQ_AUTH_FAILED)
-            
-            return apache.DONE
-       
-    def check_foaf_ssl(self, req, client):
-        print "k"
+            # And then query for wot:identity and wot:pubkeyAddress properties for
+            # the proffered identity fragid.
+            authids = context.each(subj=context.newSymbol(name),
+                                   pred=context.newSymbol(
+                                            taac.namespaces.wot.hasKey))
+            authids.extend(context.each(pred=context.newSymbol(
+                                                 taac.namespaces.wot.identity),
+                                        obj=context.newSymbol(name)))
+
+            # If we find it, check it for one of the signature types.
+            for authid in authids:
+                if not context.contains(subj=authid,
+                                        pred=context.newSymbol(taac.namespaces.rdf.type),
+                                        obj=context.newSymbol(taac.namespaces.wot.x509Certificate)):
+                    continue
+                
+                sigType = context.any(subj=authid,
+                                      pred=context.newSymbol(
+                                               taac.namespaces.wot.sigType))
+
+                if sigType != None:
+                    sigType = str(sigType.uriref())
+
+                    if sigType == taac.namespaces.wot.md5WithRSAEncryption or \
+                       sigType == taac.namespaces.wot.md2WithRSAEncryption or \
+                       sigType == taac.namespaces.wot.sha1WithRSAEncryption or\
+                       sigType == taac.namespaces.wot.sha1WithDSAEncryption:
+                        # 2. Get the sig and check it against the cert.
+                        sig = context.any(subj=authid,
+                                          pred=context.newSymbol(
+                                                 taac.namespaces.wot.sigValue))
+                        sig = str(sig).replace(':', '')
+                        sig = sig.replace(' ', '')
+
+                        sig = a2b_hex(sig)
+                        if sig == cert.signature.value()[0]:
+                            # Alright.  Pretty sure we have a match.  It's OK.
+                            pdebug(DEBUG_MESSAGE, "Signature matched!")
+                            if self.policies[requested_uri].has_key('use_policy'):
+                                pdebug(DEBUG_MESSAGE, "Appending associated use policy.")
+                                req.headers_out['x-use-policy'] = \
+                                    str(self.policies[requested_uri]['use_policy'])
+
+                            # 3. Run the AIR Reasoner over the policy and identity.
+                            req_context = self.log_request(requested_uri, name,
+                                                           taac.util.REQ_AUTH_SUCCESS)
+                            testPolicy = policyrunner.runPolicy
+                            pdebug(DEBUG_MESSAGE, "Reasoning over log and policy.")
+                            (conclusion, context) = testPolicy(
+                                [uripath.splitFrag(name)[0]],
+                                [uripath.splitFrag(self.policies[requested_uri]['access_policy'])[0]],
+                                req_context.n3String())
+                            
+                            # 4. Make the return based on what the reasoner concluded.
+
+                            pdebug(DEBUG_MESSAGE, conclusion.n3String())
+
+                            pdebug(DEBUG_MESSAGE, taac.namespaces.air['compliant-with'])
+                            pdebug(DEBUG_MESSAGE, self.policies[requested_uri]['access_policy'])
+                            compliance = conclusion.any(
+                                pred=conclusion.newSymbol(taac.namespaces.air['compliant-with']),
+                                obj=conclusion.newSymbol(self.policies[requested_uri]['access_policy']))
+
+                            pdebug(DEBUG_MESSAGE, str(compliance))
+                            
+                            # If compliance is not explicit, then it's not.
+                            if compliance == None:
+                                # Log access denied.
+                                pdebug(DEBUG_MESSAGE, "Access not compliant with policy.")
+                                self.log_completed_request(requested_uri, conclusion,
+                                                           taac.util.COMPLETE_ACC_DENIED)
+                                return apache.HTTP_FORBIDDEN
+                            else:
+                                pdebug(DEBUG_MESSAGE, "Access compliant with policy.")
+                                self.log_completed_request(requested_uri, conclusion,
+                                                           taac.util.COMPLETE_ACC_GRANTED)
+                                return apache.OK
+                        else:
+                            # We don't have a match!
+                            pdebug(DEBUG_MESSAGE, "Signature didn't match!")
+                            pdebug(DEBUG_WARNING, "Client failed to authenticate with FOAF+SSL.")
+                            self.log_completed_request(requested_uri, None,
+                                                       taac.util.COMPLETE_ACC_DENIED)
+                            return apache.HTTP_FORBIDDEN
+                    else:
+                        # Don't support it.
+                        pdebug(DEBUG_WARNING, "Client offered certificate with unsupported signature type.")
+                        self.log_completed_request(requested_uri, None,
+                                                   taac.util.COMPLETE_ACC_DENIED)
+                        return apache.HTTP_FORBIDDEN
+                else:
+                    pdebug(DEBUG_WARNING, "Can't find signature type in identity-document.")
+                    self.log_completed_request(requested_uri, None,
+                                               taac.util.COMPLETE_ACC_DENIED)
+                    return apache.HTTP_FORBIDDEN
+            pdebug(DEBUG_WARNING, "Can't find certificate signature in identity-document.")
+            self.log_completed_request(requested_uri, None,
+                                       taac.util.COMPLETE_ACC_DENIED)
+            return apache.HTTP_FORBIDDEN
+        pdebug(DEBUG_WARNING, "Can't find subjectAltName referencing identity-document.")
+        self.log_completed_request(requested_uri, None,
+                                   taac.util.COMPLETE_ACC_DENIED)
+        return apache.HTTP_FORBIDDEN
 
     def prepare_openid(self, req, client, requested_uri):
         'Performs initialization of OpenID authentication.'
@@ -690,10 +885,11 @@ class TAACServer:
             auth_header = self.get_auth_header(req)
 
             # TODO: More general protection without AC elements.
-            
+
             if self.policies[requested_uri].has_key('access_policy') and \
                    (auth_header == None \
-                    or not auth_header.params.has_key('identity-document')):
+                    or not auth_header.params.has_key('identity-document')) \
+                    and not req.subprocess_env.has_key('SSL_CLIENT_CERT'):
                 # No Authorization or identity proffered?  Then send the 401.
                 pdebug(DEBUG_MESSAGE,
                        'No Authorization/identity-document offered.')
@@ -729,7 +925,8 @@ class TAACServer:
                 # 1. Construct the proffered identity from the ident document.
                 pdebug(DEBUG_MESSAGE, 'Constructing client identity...')
                 client = taac.util.Client()
-                if auth_header.params.has_key('identity-document'):
+                if auth_header != None and \
+                       auth_header.params.has_key('identity-document'):
                     client.id = auth_header.params['identity-document']
                     if client.id != None:
                         client.id = client.id[0]
@@ -737,12 +934,14 @@ class TAACServer:
                 # The id parameter is a synonym for identity-document for
                 # RDFAuth
                 # See: http://blogs.sun.com/bblfish/entry/rdfauth_sketch_of_a_buzzword
-                elif auth_header.params.has_key('id'):
+                elif auth_header!= None and \
+                         auth_header.params.has_key('id'):
                     client.id = auth_header.params['id']
                     if client.id != None:
                         client.id = client.id[0]
                     pdebug(DEBUG_MESSAGE, 'identity-document: ' + client.id)
-                if auth_header.params.has_key('credential-document'):
+                if auth_header != None and \
+                       auth_header.params.has_key('credential-document'):
                     client.credentials = \
                         auth_header.params['credential-document']
                     if client.credentials != None:
@@ -751,7 +950,8 @@ class TAACServer:
                 # Before ANYTHING else, we should assume we aren't needing
                 # to use OpenID for authentication.  Right now, check for
                 # RDFAuth.
-                if auth_header.params.has_key('key') and \
+                if auth_header != None and \
+                   auth_header.params.has_key('key') and \
                    auth_header.params.has_key('nonce') and \
                    auth_header.params.has_key('realm'):
                     return self.check_rdfauth(req, client, requested_uri,
@@ -759,8 +959,8 @@ class TAACServer:
                                               auth_header.params['nonce'][0],
                                               auth_header.params['key'][0])
                 # TODO: Do we have a certificate thanks to a TLS handshake?
-                if False:
-                    return self.check_foaf_ssl(req, client)
+                if req.subprocess_env.has_key('SSL_CLIENT_CERT'):
+                    return self.check_foaf_ssl(req, client, requested_uri)
                 # If we don't have the openid.mode header, then we need to set
                 # up.  We clearly don't have the OpenID session ready.  When
                 # the session is ready and we've got an OpenID login, we can
