@@ -264,6 +264,29 @@ class ia5_string( asn1 ):
     return cls( contents )
 
 
+class utf8_string( asn1 ):
+  tag = 0x0C
+  der_constructed = False
+
+  def __init__( self, s ):
+    self.s = s.decode('utf-8')
+
+  def value( self ): return self.s
+
+  def __str__ ( self ): return 'UTF8 STRING: %s' % self.s
+  def __repr__( self ):
+    return '%s(%s)' % ( self.__class__.__name__, repr( self.s ) )
+
+  def as_octets( self ): return self.s.encode('utf-8')
+
+  def der_encode( self ):
+    return der_tlv( self.tag, self.s.encode('utf-8') )
+
+  @classmethod
+  def der_decode( cls, tag, contents, der_strict ):
+    return cls( contents )
+
+
 class utc_time( asn1 ):
   tag = 0x17
   der_constructed = False
@@ -281,6 +304,31 @@ class utc_time( asn1 ):
 
   def der_encode( self ):
     return der_tlv( self.tag, self.s )
+
+  @classmethod
+  def der_decode( cls, tag, contents, der_strict ):
+    return cls( contents )
+
+
+class boolean( asn1 ):
+  tag = 0x01
+  der_constructed = False
+
+  def __init__( self, b ):
+    self.b = bool(ord(b[0]))
+
+  def value( self ): return self.b
+
+  def __str__ ( self ): return 'BOOLEAN: %s' % `self.b`
+  def __repr__( self ):
+    return '%s(%s)' % ( self.__class__.__name__, repr( self.b ) )
+
+  def as_octets( self ):
+    if self.b: return "\xFF"
+    else: return "\x00"
+
+  def der_encode( self ):
+    return der_tlv( self.tag, self.as_octets() )
 
   @classmethod
   def der_decode( cls, tag, contents, der_strict ):
@@ -533,6 +581,8 @@ universal_decode_handlers = dict(( ( x.tag, x ) for x in (
   object_identifier,
   sequence,
   set_of,
+  utf8_string,
+  boolean,
 )))
 
 def der_decode( octets, der_strict = True ):
@@ -544,7 +594,7 @@ def der_decode( octets, der_strict = True ):
   contents, rest = rest[ :length ], rest[ length: ]
 
   if asn1_class == asn1_class_universal:
-    assert tag in universal_decode_handlers
+    assert tag in universal_decode_handlers, "tag '%s' not in universal_decode_handlers" % (tag)
     handler = universal_decode_handlers[ tag ]
     assert constructed == handler.der_constructed
     obj = handler.der_decode( tag, contents, der_strict )

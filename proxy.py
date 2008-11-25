@@ -561,6 +561,7 @@ class TAACServer:
         # 1.1. Extract URI subjectAltNames from client cert...
         pdebug(DEBUG_MESSAGE, 'Parsing SSL client cert...')
         cert = req.subprocess_env['SSL_CLIENT_CERT']
+        pdebug(DEBUG_MESSAGE, req.subprocess_env['SSL_CLIENT_CERT'])
         cert = "-----BEGIN CERTIFICATE-----\n" + cert + \
                "\n-----END CERTIFICATE-----\n"
         cert = x509.certificate.pem_decode(cert)
@@ -596,96 +597,80 @@ class TAACServer:
             
             # And then query for wot:identity and wot:pubkeyAddress properties for
             # the proffered identity fragid.
-            authids = context.each(subj=context.newSymbol(name),
-                                   pred=context.newSymbol(
-                                            taac.namespaces.wot.hasKey))
-            authids.extend(context.each(pred=context.newSymbol(
-                                                 taac.namespaces.wot.identity),
-                                        obj=context.newSymbol(name)))
+            authids = context.each(pred=context.newSymbol(
+                                                taac.namespaces.cert.identity),
+                                   obj=context.newSymbol(name))
 
             # If we find it, check it for one of the signature types.
             for authid in authids:
-                if not context.contains(subj=authid,
-                                        pred=context.newSymbol(taac.namespaces.rdf.type),
-                                        obj=context.newSymbol(taac.namespaces.wot.x509Certificate)):
-                    continue
-                
-                sigType = context.any(subj=authid,
-                                      pred=context.newSymbol(
-                                               taac.namespaces.wot.sigType))
+                # TODO: What about other encryptions?
+                if context.contains(subj=authid,
+                                    pred=context.newSymbol(taac.namespaces.rdf.type),
+                                    obj=context.newSymbol(taac.namespaces.rsa.RSAPublicKey)):
+                    # 2. Get the sig and check it against the cert.
+                    pubkey = cert.extract_rsa_public_key()
+                    
+                    pubexp = context.any(subj=authid,
+                                         pred=context.newSymbol(taac.namespaces.rsa.public_exponent))
+                    pubexp = int(pubexp)
 
-                if sigType != None:
-                    sigType = str(sigType.uriref())
+                    modulus = context.any(subj=authid,
+                                          pred=context.newSymbol(taac.namespaces.rsa.modulus))
+                    modulus = str(modulus).replace(':', '')
+                    modulus = modulus.replace(' ', '')
+                    modulus = long(modulus, 16)
+                    if pubexp == pubkey.rsa_public_exponent() and modulus == pubkey.rsa_modulus():
+                        # Alright.  Pretty sure we have a match.  It's OK.
+                        pdebug(DEBUG_MESSAGE, "Signature matched!")
+                        if self.policies[requested_uri].has_key('use_policy'):
+                            pdebug(DEBUG_MESSAGE, "Appending associated use policy.")
+                            req.headers_out['x-use-policy'] = \
+                                str(self.policies[requested_uri]['use_policy'])
 
-                    if sigType == taac.namespaces.wot.md5WithRSAEncryption or \
-                       sigType == taac.namespaces.wot.md2WithRSAEncryption or \
-                       sigType == taac.namespaces.wot.sha1WithRSAEncryption or\
-                       sigType == taac.namespaces.wot.sha1WithDSAEncryption:
-                        # 2. Get the sig and check it against the cert.
-                        sig = context.any(subj=authid,
-                                          pred=context.newSymbol(
-                                                 taac.namespaces.wot.sigValue))
-                        sig = str(sig).replace(':', '')
-                        sig = sig.replace(' ', '')
-
-                        sig = a2b_hex(sig)
-                        if sig == cert.signature.value()[0]:
-                            # Alright.  Pretty sure we have a match.  It's OK.
-                            pdebug(DEBUG_MESSAGE, "Signature matched!")
-                            if self.policies[requested_uri].has_key('use_policy'):
-                                pdebug(DEBUG_MESSAGE, "Appending associated use policy.")
-                                req.headers_out['x-use-policy'] = \
-                                    str(self.policies[requested_uri]['use_policy'])
-
-                            # 3. Run the AIR Reasoner over the policy and identity.
-                            req_context = self.log_request(requested_uri, name,
-                                                           taac.util.REQ_AUTH_SUCCESS)
-                            testPolicy = policyrunner.runPolicy
-                            pdebug(DEBUG_MESSAGE, "Reasoning over log and policy.")
-                            (conclusion, context) = testPolicy(
-                                [uripath.splitFrag(name)[0]],
-                                [uripath.splitFrag(self.policies[requested_uri]['access_policy'])[0]],
-                                req_context.n3String())
+                        # 3. Run the AIR Reasoner over the policy and identity.
+                        req_context = self.log_request(requested_uri, name,
+                                                       taac.util.REQ_AUTH_SUCCESS)
+                        testPolicy = policyrunner.runPolicy
+                        pdebug(DEBUG_MESSAGE, "Reasoning over log and policy.")
+                        (conclusion, context) = testPolicy(
+                            [uripath.splitFrag(name)[0]],
+                            [uripath.splitFrag(self.policies[requested_uri]['access_policy'])[0]],
+                            req_context.n3String())
                             
-                            # 4. Make the return based on what the reasoner concluded.
+                        # 4. Make the return based on what the reasoner concluded.
 
-                            pdebug(DEBUG_MESSAGE, conclusion.n3String())
+                        pdebug(DEBUG_MESSAGE, conclusion.n3String())
 
-                            pdebug(DEBUG_MESSAGE, taac.namespaces.air['compliant-with'])
-                            pdebug(DEBUG_MESSAGE, self.policies[requested_uri]['access_policy'])
-                            compliance = conclusion.any(
-                                pred=conclusion.newSymbol(taac.namespaces.air['compliant-with']),
-                                obj=conclusion.newSymbol(self.policies[requested_uri]['access_policy']))
+                        pdebug(DEBUG_MESSAGE, taac.namespaces.air['compliant-with'])
+                        pdebug(DEBUG_MESSAGE, self.policies[requested_uri]['access_policy'])
+                        compliance = conclusion.any(
+                            pred=conclusion.newSymbol(taac.namespaces.air['compliant-with']),
+                            obj=conclusion.newSymbol(self.policies[requested_uri]['access_policy']))
 
-                            pdebug(DEBUG_MESSAGE, str(compliance))
+                        pdebug(DEBUG_MESSAGE, str(compliance))
                             
-                            # If compliance is not explicit, then it's not.
-                            if compliance == None:
-                                # Log access denied.
-                                pdebug(DEBUG_MESSAGE, "Access not compliant with policy.")
-                                self.log_completed_request(requested_uri, conclusion,
-                                                           taac.util.COMPLETE_ACC_DENIED)
-                                return apache.HTTP_FORBIDDEN
-                            else:
-                                pdebug(DEBUG_MESSAGE, "Access compliant with policy.")
-                                self.log_completed_request(requested_uri, conclusion,
-                                                           taac.util.COMPLETE_ACC_GRANTED)
-                                return apache.OK
-                        else:
-                            # We don't have a match!
-                            pdebug(DEBUG_MESSAGE, "Signature didn't match!")
-                            pdebug(DEBUG_WARNING, "Client failed to authenticate with FOAF+SSL.")
-                            self.log_completed_request(requested_uri, None,
+                        # If compliance is not explicit, then it's not.
+                        if compliance == None:
+                            # Log access denied.
+                            pdebug(DEBUG_MESSAGE, "Access not compliant with policy.")
+                            self.log_completed_request(requested_uri, conclusion,
                                                        taac.util.COMPLETE_ACC_DENIED)
                             return apache.HTTP_FORBIDDEN
+                        else:
+                            pdebug(DEBUG_MESSAGE, "Access compliant with policy.")
+                            self.log_completed_request(requested_uri, conclusion,
+                                                       taac.util.COMPLETE_ACC_GRANTED)
+                            return apache.OK
                     else:
-                        # Don't support it.
-                        pdebug(DEBUG_WARNING, "Client offered certificate with unsupported signature type.")
+                        # We don't have a match!
+                        pdebug(DEBUG_MESSAGE, "Signature didn't match!")
+                        pdebug(DEBUG_WARNING, "Client failed to authenticate with FOAF+SSL.")
                         self.log_completed_request(requested_uri, None,
                                                    taac.util.COMPLETE_ACC_DENIED)
                         return apache.HTTP_FORBIDDEN
                 else:
-                    pdebug(DEBUG_WARNING, "Can't find signature type in identity-document.")
+                    # Don't support it.
+                    pdebug(DEBUG_WARNING, "Client offered certificate with unsupported signature type.")
                     self.log_completed_request(requested_uri, None,
                                                taac.util.COMPLETE_ACC_DENIED)
                     return apache.HTTP_FORBIDDEN
