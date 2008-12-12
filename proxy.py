@@ -35,6 +35,7 @@ from openid.message import BARE_NS
 from tmswap import llyn
 from tmswap import myStore
 from tmswap.RDFSink import SUBJ, OBJ
+from tmswap.term import Literal
 from tmswap import uripath
 from tmswap import policyrunner
 
@@ -54,7 +55,7 @@ def pdebug(message_debug_level, message):
                       DEBUG_WARNING: apache.APLOG_WARNING,
                       DEBUG_MESSAGE: apache.APLOG_NOTICE }
     if DEBUG_LEVEL >= message_debug_level:
-        apache.log_error(message, level_mapping[message_debug_level])
+        apache.log_error(message.encode('utf-8'), level_mapping[message_debug_level])
 #        sys.stdout.write(message + "\n")
 
 def getTimestampFromNonceTuple(a):
@@ -264,7 +265,7 @@ class TAACServer:
             line = line.strip() + "\n"
 #        if len(line) > 0 and line[0] == '@':
 #            continue
-            log.write(line)
+            log.write(line.encode('utf-8'))
         log.close()
 #    apache.log_error(context.n3String(), apache.APLOG_ERR)
 
@@ -609,14 +610,35 @@ class TAACServer:
                                     obj=context.newSymbol(taac.namespaces.rsa.RSAPublicKey)):
                     # 2. Get the sig and check it against the cert.
                     pubkey = cert.extract_rsa_public_key()
-                    
+
+                    # TODO: Handle this 'resourcification' of literals more cleanly.
                     pubexp = context.any(subj=authid,
                                          pred=context.newSymbol(taac.namespaces.rsa.public_exponent))
-                    pubexp = int(pubexp)
+                    if not isinstance(pubexp, Literal):
+                        pubexp = context.any(subj=pubexp,
+                                             pred=context.newSymbol(taac.namespaces.cert.decimal))
+                    try:
+                        pubexp = int(pubexp)
+                    except TypeError:
+                        pdebug(DEBUG_MESSAGE, "Couldn't extract public exponent!")
+                        pdebug(DEBUG_WARNING, "Client failed to authenticate with FOAF+SSL.")
+                        self.log_completed_request(requested_uri, None,
+                                                   taac.util.COMPLETE_ACC_DENIED)
+                        return apache.HTTP_FORBIDDEN
 
                     modulus = context.any(subj=authid,
                                           pred=context.newSymbol(taac.namespaces.rsa.modulus))
-                    modulus = str(modulus).replace(':', '')
+                    if not isinstance(modulus, Literal):
+                        modulus = context.any(subj=modulus,
+                                              pred=context.newSymbol(taac.namespaces.cert.hex))
+                    try:
+                        modulus = str(modulus).replace(':', '')
+                    except TypeError:
+                        pdebug(DEBUG_MESSAGE, "Couldn't extract modulus!")
+                        pdebug(DEBUG_WARNING, "Client failed to authenticate with FOAF+SSL.")
+                        self.log_completed_request(requested_uri, None,
+                                                   taac.util.COMPLETE_ACC_DENIED)
+                        return apache.HTTP_FORBIDDEN
                     modulus = modulus.replace(' ', '')
                     modulus = long(modulus, 16)
                     if pubexp == pubkey.rsa_public_exponent() and modulus == pubkey.rsa_modulus():
