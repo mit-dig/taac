@@ -570,7 +570,7 @@ class TAACServer:
                    "\n-----END CERTIFICATE-----\n"
         else:
             cert = req.ssl_var_lookup('SSL_CLIENT_CERT')
-        pdebug(DEBUG_MESSAGE, cert, req)
+#        pdebug(DEBUG_MESSAGE, cert, req)
         cert = x509.certificate.pem_decode(cert)
 
         pdebug(DEBUG_MESSAGE, 'Searching for subjectAltName extension...', req)
@@ -1040,7 +1040,8 @@ DEBUG_WARNING = 1
 DEBUG_MESSAGE = 2
 DEBUG_LEVEL = DEBUG_MESSAGE
 
-def accesshandler(req):
+def fixuphandler(req):
+#def handler(req):
     'This is just a wrapper so that we can optionally profile.'
 
     # Reload the custom modules to ensure that changes are represented.
