@@ -34,7 +34,7 @@ from openid.message import BARE_NS
 # And tmswap imports...
 from tmswap import llyn
 from tmswap import myStore
-from tmswap.RDFSink import SUBJ, OBJ
+from tmswap.RDFSink import SUBJ, PRED, OBJ
 from tmswap.term import Literal
 from tmswap import uripath
 from tmswap import policyrunner
@@ -120,6 +120,10 @@ class TAACServer:
                                       remember=0,
                                       referer = '',
                                       topLevel = True)
+            openContext = self.store.newFormula()
+            for statement in context.statements:
+                openContext.add(statement[SUBJ], statement[PRED], statement[OBJ])
+            context = openContext
         except:# (IOError, SyntaxError, DocumentError):
             # TODO: Actually record an error somewhere.
             apache.log_error("Unexpected error:" + traceback.format_exc(),
@@ -128,10 +132,6 @@ class TAACServer:
 #        throw_http_error(apache.HTTP_INTERNAL_SERVER_ERROR,
 #                         "The AIR proxy has not been properly configured: " + \
 #                         "The policies file could not be read properly.")
-        # Currently voodoo magic.
-        # TODO: How does rdflib work ANYWAY?
-        context.reopen()
-        context.stayOpen = 1
         
         # Okay, I assume that worked.  Let's build the dict of files and their
         # corresponding policies.
@@ -368,199 +368,6 @@ class TAACServer:
         for nonce in nonces_to_delete:
             del self.nonces[nonce]
 
-    def check_rdfauth(self, req, client, requested_uri, realm, nonce, signature):
-        """Performs RDFAuth authentication.  See:
-        http://blogs.sun.com/bblfish/entry/rdfauth_sketch_of_a_buzzword"""
-
-        pdebug(DEBUG_MESSAGE, 'Attempting to use RDFAuth...', req)
-
-        # 1.1. Confirm that the nonce and realm provided are associated, and
-        # remove them.
-
-        if not self.has_nonce(nonce, realm):
-            pdebug(DEBUG_WARNING,
-                   "Nonce '%s' isn't associated with realm '%s'. Replay attack?" %
-                   (nonce, realm), req)
-            policy = self.policies[requested_uri]
-            nonce = self.issue_nonce(q(policy['realm']), req)
-            auth_header = 'TAAC realm="%s",policy="%s",nonce="%s"' % \
-                          (q(policy['realm']),
-                           q(policy['access_policy']),
-                           q(nonce))
-            pdebug(DEBUG_MESSAGE,
-                   'Requesting authentication: %s' % (auth_header), req)
-            taac.util.request_authentication(req, self.policies[requested_uri])
-            
-            # Log this request, but note no openid.
-            self.log_request(requested_uri, client.id, taac.util.REQ_NO_AUTH)
-            
-            return apache.DONE
-
-        # 1.2. Try to get the PGP public key associated with the ident doc.
-        pdebug(DEBUG_MESSAGE, "Trying to get client's claimed PGP public key.", req)
-        
-        # Get the document and parse in the RDF graph...
-        if self.store == None:
-            store = llyn.RDFStore()
-            myStore.setStore(store)
-        try:
-            context = self.store.load(uri = uripath.splitFrag(client.id)[0],
-                                      remember = 0,
-                                      referer = '',
-                                      topLevel = True)
-        except:# (IOError, SyntaxError, DocumentError):
-            # TODO: Actually record an error somewhere.
-            apache.log_error("Unexpected error:" + traceback.format_exc(),
-                             apache.APLOG_ERR)
-            raise apache.SERVER_RETURN, \
-                  apache.HTTP_INTERNAL_SERVER_ERROR
-        # Currently voodoo magic.
-        # TODO: How does rdflib work ANYWAY?
-        context.reopen()
-        context.stayOpen = 1
-        
-        # And then query for wot:identity and wot:pubkeyAddress properties for
-        # the proffered identity fragid.
-        authids = context.each(subj=context.newSymbol(client.id),
-                               pred=context.newSymbol(
-                                        taac.namespaces.wot.hasKey))
-        authids.extend(context.each(pred=context.newSymbol(
-                                             taac.namespaces.wot.identity),
-                                    obj=context.newSymbol(client.id)))
-        
-        # If we don't find it, return a 401.
-        if authids == []:
-            pdebug(DEBUG_WARNING,
-                   "Couldn't find public key address in identity-document.", req)
-            policy = self.policies[requested_uri]
-            nonce = self.issue_nonce(q(policy['realm']))
-            auth_header = 'TAAC realm="%s",policy="%s",nonce="%s"' % \
-                          (q(policy['realm']),
-                           q(policy['access_policy']),
-                           q(nonce))
-            pdebug(DEBUG_MESSAGE,
-                   'Requesting authentication: %s' % (auth_header), req)
-            taac.util.request_authentication(req, self.policies[requested_uri])
-            
-            # Log this request, but note no public key.
-            self.log_request(requested_uri, client.id, taac.util.REQ_NO_AUTH)
-            
-            return apache.DONE
-
-        for authid in authids:
-            pubkey = context.any(subj=authid,
-                                 pred=context.newSymbol(
-                                          taac.namespaces.wot.pubkeyAddress))
-
-            if pubkey == None:
-                continue
-            
-            pubkey = str(pubkey.uriref())
-            
-            pdebug(DEBUG_MESSAGE, 'Public key address: %s' % (pubkey), req)
-            pdebug(DEBUG_MESSAGE, 'Populating keyring with public key...', req)
-            
-            f = urllib2.urlopen(pubkey)
-            pubkey = f.read()
-            f.close()
-            
-            keys = openpgp.parsePGPKeys(pubkey)
-            ring = openpgp.PGPKeyRing()
-            for key in keys:
-                ring.addKey(key)
-                
-            # 2. Check the provided signature against the expected message.
-            pdebug(DEBUG_MESSAGE, 'Attempting to verify provided signature...', req)
-            
-            # The message is "(realm):(nonce)"
-            message = realm + ':' + nonce
-            
-            # Build the signature ASCII-armored packet from the pure sig.
-            signature = "-----BEGIN PGP SIGNATURE-----\n" + \
-                        "\n" + \
-                        signature + "\n" + \
-                        "-----END PGP SIGNATURE-----\n"
-            
-            signature = openpgp.parsePGPSignature(signature)
-            digest = signature.prepareDigest()
-            digest.update(message)
-            digest = signature.finishDigest(digest)
-            
-            (match, key) = signature.verifyDigest(ring, digest)
-            
-            if match == 1:
-                # We good.
-                pdebug(DEBUG_MESSAGE, "Signature matched!", req)
-                if self.policies[requested_uri].has_key('use_policy'):
-                    pdebug(DEBUG_MESSAGE, "Appending associated use policy.", req)
-                    req.headers_out['x-use-policy'] = \
-                        str(self.policies[requested_uri]['use_policy'])
-                
-                # 3. Run the AIR Reasoner over the policy and identity.
-                req_context = self.log_request(requested_uri, client.id,
-                                               taac.util.REQ_AUTH_SUCCESS)
-                testPolicy = policyrunner.runPolicy
-                pdebug(DEBUG_MESSAGE, "Reasoning over log and policy.", req)
-                (conclusion, context) = testPolicy(
-                    [uripath.splitFrag(client.id)[0]],
-                    [uripath.splitFrag(self.policies[requested_uri]['access_policy'])[0]],
-                    req_context.n3String())
-                
-                # 4. Make the return based on what the reasoner concluded.
-                
-                compliance = conclusion.any(
-                    pred=conclusion.newSymbol(taac.namespaces.air['compliant-with']),
-                    obj=conclusion.newSymbol(self.policies[requested_uri]['access_policy']))
-                
-                # If compliance is not explicit, then it's not.
-                if compliance == None:
-                    # Log access denied.
-                    pdebug(DEBUG_MESSAGE, "Access not compliant with policy.", req)
-                    self.log_completed_request(requested_uri, conclusion,
-                                               taac.util.COMPLETE_ACC_DENIED)
-                    return apache.HTTP_FORBIDDEN
-                else:
-                    pdebug(DEBUG_MESSAGE, "Access compliant with policy.", req)
-                    self.log_completed_request(requested_uri, conclusion,
-                                               taac.util.COMPLETE_ACC_GRANTED)
-                    return apache.OK
-            else:
-                # We not good.
-                pdebug(DEBUG_MESSAGE, "Signature didn't match!", req)
-                pdebug(DEBUG_WARNING, "Client failed to authenticate with RDFAuth.", req)
-                
-                policy = self.policies[requested_uri]
-                nonce = self.issue_nonce(q(policy['realm']))
-                auth_header = 'TAAC realm="%s",policy="%s",nonce="%s"' % \
-                              (q(policy['realm']),
-                               q(policy['access_policy']),
-                               q(nonce))
-                pdebug(DEBUG_MESSAGE,
-                       'Requesting authentication: %s' % (auth_header), req)
-                taac.util.request_authentication(req, auth_header)
-                
-                self.log_request(requested_uri, client.id,
-                                 taac.util.REQ_AUTH_FAILED)
-                
-                return apache.DONE
-        
-        pdebug(DEBUG_WARNING,
-               "Couldn't find public key address in identity-document.", req)
-        policy = self.policies[requested_uri]
-        nonce = self.issue_nonce(q(policy['realm']))
-        auth_header = 'TAAC realm="%s",policy="%s",nonce="%s"' % \
-                      (q(policy['realm']),
-                       q(policy['access_policy']),
-                       q(nonce))
-        pdebug(DEBUG_MESSAGE,
-               'Requesting authentication: %s' % (auth_header), req)
-        taac.util.request_authentication(req, self.policies[requested_uri])
-        
-        # Log this request, but note no public key.
-        self.log_request(requested_uri, client.id, taac.util.REQ_NO_AUTH)
-        
-        return apache.DONE
-    
     def check_foaf_ssl(self, req, client, requested_uri):
         # 1.1. Extract URI subjectAltNames from client cert...
         pdebug(DEBUG_MESSAGE, 'Parsing SSL client cert...', req)
@@ -591,16 +398,16 @@ class TAACServer:
                                           remember = 0,
                                           referer = '',
                                           topLevel = True)
+                openContext = self.store.newFormula()
+                for statement in context.statements:
+                    openContext.add(statement[SUBJ], statement[PRED], statement[OBJ])
+                context = openContext
             except:# (IOError, SyntaxError, DocumentError):
                 # TODO: Actually record an error somewhere.
                 apache.log_error("Unexpected error:" + traceback.format_exc(),
                                  apache.APLOG_ERR)
                 raise apache.SERVER_RETURN, \
                       apache.HTTP_INTERNAL_SERVER_ERROR
-            # Currently voodoo magic.
-            # TODO: How does rdflib work ANYWAY?
-            context.reopen()
-            context.stayOpen = 1
             
             # And then query for wot:identity and wot:pubkeyAddress properties for
             # the proffered identity fragid.
@@ -728,16 +535,16 @@ class TAACServer:
                                       remember = 0,
                                       referer = '',
                                       topLevel = True)
+            openContext = self.store.newFormula()
+            for statement in context.statements:
+                openContext.add(statement[SUBJ], statement[PRED], statement[OBJ])
+            context = openContext
         except:# (IOError, SyntaxError, DocumentError):
             # TODO: Actually record an error somewhere.
             apache.log_error("Unexpected error:" + traceback.format_exc(),
                              apache.APLOG_ERR)
             raise apache.SERVER_RETURN, \
                   apache.HTTP_INTERNAL_SERVER_ERROR
-        # Currently voodoo magic.
-        # TODO: How does rdflib work ANYWAY?
-        context.reopen()
-        context.stayOpen = 1
         
         # And then query for a foaf:openid property for the
         # proffered identity fragid.
@@ -936,42 +743,6 @@ class TAACServer:
                 params = dict(zip(params.keys(),
                                   map(lambda x: (x[0]), params.values())))
                 
-                # 1. Construct the proffered identity from the ident document.
-                pdebug(DEBUG_MESSAGE, 'Constructing client identity...', req)
-                client = taac.util.Client()
-                if auth_header != None and \
-                       auth_header.params.has_key('identity-document'):
-                    client.id = auth_header.params['identity-document']
-                    if client.id != None:
-                        client.id = client.id[0]
-                    pdebug(DEBUG_MESSAGE, 'identity-document: ' + client.id, req)
-                # The id parameter is a synonym for identity-document for
-                # RDFAuth
-                # See: http://blogs.sun.com/bblfish/entry/rdfauth_sketch_of_a_buzzword
-                elif auth_header!= None and \
-                         auth_header.params.has_key('id'):
-                    client.id = auth_header.params['id']
-                    if client.id != None:
-                        client.id = client.id[0]
-                    pdebug(DEBUG_MESSAGE, 'identity-document: ' + client.id, req)
-                if auth_header != None and \
-                       auth_header.params.has_key('credential-document'):
-                    client.credentials = \
-                        auth_header.params['credential-document']
-                    if client.credentials != None:
-                        client.credentials = client.credentials[0]
-
-                # Before ANYTHING else, we should assume we aren't needing
-                # to use OpenID for authentication.  Right now, check for
-                # RDFAuth.
-                if auth_header != None and \
-                   auth_header.params.has_key('key') and \
-                   auth_header.params.has_key('nonce') and \
-                   auth_header.params.has_key('realm'):
-                    return self.check_rdfauth(req, client, requested_uri,
-                                              auth_header.params['realm'][0],
-                                              auth_header.params['nonce'][0],
-                                              auth_header.params['key'][0])
                 # TODO: Do we have a certificate thanks to a TLS handshake?
                 if req.subprocess_env.has_key('SSL_CLIENT_CERT') or \
                        req.ssl_var_lookup('SSL_CLIENT_CERT') != '':
