@@ -71,7 +71,7 @@ def extractURISubjectAltNames(cert):
         if optfield.tag == 3:
             for ext in optfield.value():
                 if ext[0].value() == (2, 5, 29, 17):
-                    alt_names, rest = asn1.der_decode(ext[1].value())
+                    alt_names, rest = asn1.der_decode(ext[-1].value())
                     assert rest == ''
                 if alt_names != None:
                     break
@@ -743,6 +743,31 @@ class TAACServer:
                 params = dict(zip(params.keys(),
                                   map(lambda x: (x[0]), params.values())))
                 
+                # 1. Construct the proffered identity from the ident document.
+                pdebug(DEBUG_MESSAGE, 'Constructing client identity...', req)
+                client = taac.util.Client()
+                if auth_header != None and \
+                       auth_header.params.has_key('identity-document'):
+                    client.id = auth_header.params['identity-document']
+                    if client.id != None:
+                        client.id = client.id[0]
+                    pdebug(DEBUG_MESSAGE, 'identity-document: ' + client.id, req)
+                # The id parameter is a synonym for identity-document for
+                # RDFAuth
+                # See: http://blogs.sun.com/bblfish/entry/rdfauth_sketch_of_a_buzzword
+                elif auth_header!= None and \
+                         auth_header.params.has_key('id'):
+                    client.id = auth_header.params['id']
+                    if client.id != None:
+                        client.id = client.id[0]
+                    pdebug(DEBUG_MESSAGE, 'identity-document: ' + client.id, req)
+                if auth_header != None and \
+                       auth_header.params.has_key('credential-document'):
+                    client.credentials = \
+                        auth_header.params['credential-document']
+                    if client.credentials != None:
+                        client.credentials = client.credentials[0]
+
                 # TODO: Do we have a certificate thanks to a TLS handshake?
                 if req.subprocess_env.has_key('SSL_CLIENT_CERT') or \
                        req.ssl_var_lookup('SSL_CLIENT_CERT') != '':
@@ -814,7 +839,6 @@ DEBUG_LEVEL = DEBUG_MESSAGE
 def fixuphandler(req):
 #def handler(req):
     'This is just a wrapper so that we can optionally profile.'
-
     # Reload the custom modules to ensure that changes are represented.
     if DEBUG_LEVEL > 0:
         taac.config = reload(taac.config)
