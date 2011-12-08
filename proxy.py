@@ -21,6 +21,8 @@ import md5
 import time
 import urllib2
 from binascii import a2b_hex
+import urlparse
+import httplib
 
 import traceback
 import hotshot
@@ -389,47 +391,81 @@ class TAACServer:
             # 1.2. Try to get the signature associated with the ident doc.
             pdebug(DEBUG_MESSAGE, "Trying to get signature from ident doc...", req)
             
-            # Get the document and parse in the RDF graph...
             if self.store == None:
                 store = llyn.RDFStore()
                 myStore.setStore(store)
-            try:
-                context = self.store.load(uri = uripath.splitFrag(name)[0],
-                                          remember = 0,
-                                          referer = '',
-                                          topLevel = True)
-                openContext = self.store.newFormula()
-                for statement in context.statements:
-                    openContext.add(statement[SUBJ], statement[PRED], statement[OBJ])
-                context = openContext
-            except:# (IOError, SyntaxError, DocumentError):
-                # TODO: Actually record an error somewhere.
-                apache.log_error("Unexpected error:" + traceback.format_exc(),
+            
+            # Fetch the document.
+            url = urlparse.urlsplit(uripath.splitFrag(name)[0])
+            c = httplib.HTTPConnection(url.netloc)
+            c.request('GET', url.path + url.query, headers={'accept': 'application/rdf+xml; q=0.9, text/turtle; q=0.8, application/xhtml+xml; q=0.5, text/html; q=0.3'})
+            resp = c.getresponse()
+            type = resp.getheader('content-type')
+            if type == 'application/rdf+xml' or type.startswith('text/turtle'):
+                # We can parse directly.
+                resp.read()
+                c.close()
+                
+                # Get the document and parse in the RDF graph...
+                try:
+                    context = self.store.load(uri = uripath.splitFrag(name)[0],
+                                              remember = 0,
+                                              referer = '',
+                                              topLevel = True)
+                    openContext = self.store.newFormula()
+                    for statement in context.statements:
+                        openContext.add(statement[SUBJ], statement[PRED],
+                                        statement[OBJ])
+                    context = openContext
+                except:# (IOError, SyntaxError, DocumentError):
+                    # TODO: Actually record an error somewhere.
+                    apache.log_error("Unexpected error:" +
+                                     traceback.format_exc(),
+                                     apache.APLOG_ERR)
+                    raise apache.SERVER_RETURN, \
+                        apache.HTTP_INTERNAL_SERVER_ERROR
+            elif type == 'application/xhtml+xml' or type.startswith('text/html'):
+                # Need to parse the RDFa.
+                # For now, use rdflib
+                try:
+                    graph = rdflib.graph.Graph()
+                    graph.parse(uripath.splitFrag(name)[0], format='rdfa')
+                    openContext = self.store.newFormula()
+                    for statement in graph:
+                        openContext.add(*statement)
+                    context = openContext
+                except:
+                    # TODO: Actually record an error somewhere.
+                    apache.log_error("Unexpected error:" +
+                                     traceback.format_exc(),
+                                     apache.APLOG_ERR)
+                    raise apache.SERVER_RETURN, \
+                        apache.HTTP_INTERNAL_SERVER_ERROR
+            else:
+                apache.log_error("Unexpected error: Content-Type = " +
+                                 type,
                                  apache.APLOG_ERR)
                 raise apache.SERVER_RETURN, \
-                      apache.HTTP_INTERNAL_SERVER_ERROR
+                    apache.HTTP_INTERNAL_SERVER_ERROR
             
-            # And then query for wot:identity and wot:pubkeyAddress properties for
-            # the proffered identity fragid.
-            authids = context.each(pred=context.newSymbol(
-                                                taac.namespaces.cert.identity),
-                                   obj=context.newSymbol(name))
+            # And then query for wot:identity and wot:pubkeyAddress
+            # properties for the proffered identity fragid.
+            authids = context.each(subj=context.newSymbol(name),
+                                   pred=context.newSymbol(
+                                                taac.namespaces.cert.key))
 
             # If we find it, check it for one of the signature types.
             for authid in authids:
                 # TODO: What about other encryptions?
-                if context.contains(subj=authid,
-                                    pred=context.newSymbol(taac.namespaces.rdf.type),
-                                    obj=context.newSymbol(taac.namespaces.rsa.RSAPublicKey)):
+#                if context.contains(subj=authid,
+#                                    pred=context.newSymbol(taac.namespaces.rdf.type),
+#                                    obj=context.newSymbol(taac.namespaces.rsa.RSAPublicKey)):
                     # 2. Get the sig and check it against the cert.
                     pubkey = cert.extract_rsa_public_key()
 
                     # TODO: Handle this 'resourcification' of literals more cleanly.
                     pubexp = context.any(subj=authid,
-                                         pred=context.newSymbol(taac.namespaces.rsa.public_exponent))
-                    if not isinstance(pubexp, Literal):
-                        pubexp = context.any(subj=pubexp,
-                                             pred=context.newSymbol(taac.namespaces.cert.decimal))
+                                         pred=context.newSymbol(taac.namespaces.cert.exponent))
                     try:
                         pubexp = int(pubexp)
                     except TypeError:
@@ -440,12 +476,10 @@ class TAACServer:
                         return apache.HTTP_FORBIDDEN
 
                     modulus = context.any(subj=authid,
-                                          pred=context.newSymbol(taac.namespaces.rsa.modulus))
-                    if not isinstance(modulus, Literal):
-                        modulus = context.any(subj=modulus,
-                                              pred=context.newSymbol(taac.namespaces.cert.hex))
+                                          pred=context.newSymbol(taac.namespaces.cert.modulus))
                     try:
-                        modulus = str(modulus).replace(':', '')
+                        datatype = modulus.datatype
+                        modulus = str(modulus)
                     except TypeError:
                         pdebug(DEBUG_MESSAGE, "Couldn't extract modulus!", req)
                         pdebug(DEBUG_WARNING, "Client failed to authenticate with FOAF+SSL.", req)
@@ -453,7 +487,28 @@ class TAACServer:
                                                    taac.util.COMPLETE_ACC_DENIED)
                         return apache.HTTP_FORBIDDEN
                     modulus = modulus.replace(' ', '')
-                    modulus = long(modulus, 16)
+                    if datatype == context.newSymbol(taac.namespaces.xsd.base64Binary):
+                        try:
+                            modulus = base64.b64decode(modulus)
+                            # Turn into a long.
+                            modulus = ''.join(map(lambda x: hex(ord(x)),
+                                                  modulus))
+                            modulus = long(modulus, 16)
+                        except:
+                            modulus = None
+                    else:
+                        try:
+                            modulus = long(modulus, 16)
+                        except:
+                            # Fall back on base64 anyway.
+                            try:
+                                modulus = base64.b64decode(modulus)
+                                # Turn into a long.
+                                modulus = ''.join(map(lambda x: hex(ord(x)),
+                                                      modulus))
+                                modulus = long(modulus, 16)
+                            except:
+                                modulus = None
                     if pubexp == pubkey.rsa_public_exponent() and modulus == pubkey.rsa_modulus():
                         # Alright.  Pretty sure we have a match.  It's OK.
                         pdebug(DEBUG_MESSAGE, "Signature matched!", req)
@@ -503,12 +558,12 @@ class TAACServer:
                         self.log_completed_request(requested_uri, None,
                                                    taac.util.COMPLETE_ACC_DENIED)
                         return apache.HTTP_FORBIDDEN
-                else:
-                    # Don't support it.
-                    pdebug(DEBUG_WARNING, "Client offered certificate with unsupported signature type.", req)
-                    self.log_completed_request(requested_uri, None,
-                                               taac.util.COMPLETE_ACC_DENIED)
-                    return apache.HTTP_FORBIDDEN
+#                else:
+#                    # Don't support it.
+#                    pdebug(DEBUG_WARNING, "Client offered certificate with unsupported signature type.", req)
+#                    self.log_completed_request(requested_uri, None,
+#                                               taac.util.COMPLETE_ACC_DENIED)
+#                    return apache.HTTP_FORBIDDEN
             pdebug(DEBUG_WARNING, "Can't find certificate signature in identity-document.", req)
             self.log_completed_request(requested_uri, None,
                                        taac.util.COMPLETE_ACC_DENIED)
