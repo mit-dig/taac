@@ -32,6 +32,11 @@ from mod_python import apache, util
 from openid.consumer.consumer import Consumer, SUCCESS
 from openid.store.filestore import FileOpenIDStore
 from openid.message import BARE_NS
+try:
+    import rdflib.graph
+    import rdflib.term
+except:
+    pass
 
 # And tmswap imports...
 from tmswap import llyn
@@ -89,6 +94,26 @@ def extractURISubjectAltNames(cert):
             alt_names_array.append(alt_name.value())
 
     return alt_names_array
+
+BNodeMap = {}
+def rdflibNodeToTerm(node, formula):
+    """Convert an rdflib.Node object to a cwm Term object."""
+    if isinstance(node, rdflib.term.BNode):
+        return BNodeMap.setdefault(formula, {}).setdefault(
+            node, formula.newBlankNode())
+    elif isinstance(node, rdflib.term.Literal):
+        if node.datatype is not None:
+            return formula.newLiteral(str(node),
+                                      dt=rdflibNodeToTerm(node.datatype,
+                                                          formula))
+        elif node.language is not None:
+            return formula.newLiteral(str(node), lang=node.lang)
+        else:
+            return formula.newLiteral(str(node))
+    elif isinstance(node, rdflib.term.URIRef):
+        return formula.newSymbol(str(node))
+    else:
+        raise Exception("what is this node?")
 
 class TAACServer:
     def __init__(self, base_uri, base_path, req):
@@ -432,7 +457,13 @@ class TAACServer:
                     graph.parse(uripath.splitFrag(name)[0], format='rdfa')
                     openContext = self.store.newFormula()
                     for statement in graph:
-                        openContext.add(*statement)
+                        # Translate from rdflib to cwm types
+                        subj = rdflibNodeToTerm(statement[0], openContext)
+                        pred = rdflibNodeToTerm(statement[1], openContext)
+                        obj = rdflibNodeToTerm(statement[2], openContext)
+                        openContext.add(subj, pred, obj)
+                    if openContext in BNodeMap:
+                        del BNodeMap[openContext]
                     context = openContext
                 except:
                     # TODO: Actually record an error somewhere.
