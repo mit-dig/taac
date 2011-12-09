@@ -1,0 +1,87 @@
+Installing TAAC:
+
+1. Get the TAAC source code from http://dig.csail.mit.edu/hg/taac (You
+   already did this!)
+
+2. Get the tmswap directory needed for TAAC to properly operate and
+   copy it into the directory in which proxy.py sits.
+   - You may clone from http://dig.csail.mit.edu/hg/air-reasoner, take
+     the airreasoner/ directory, and copy that into the taac source
+     code directory under the name tmswap/.  If the airreasoner/
+     directory does not exist, then take the contents of the root of
+     the repository.
+
+3. Install rdflib (http://www.rdflib.net/) if you want RDFa support.
+   Otherwise (right now) you'll get a mod_python error if you try to
+   access with an RDFa-based subjectAltUrl.
+
+You should now have a directory layout which looks something like the
+following:
+
+   taac/
+     proxy.py
+     tmswap/ [copied from the air-reasoner repository]
+       policyrunner.py
+       ...
+     taac/
+       __init__.py
+       ...
+
+4. Configure TAAC.  The primary configuration for TAAC is in
+  taac/config.py. You most probably don’t need to change any of the
+  settings, but you should be aware of their setting, as it impacts
+  the remainder of this installation process. POLICY_FILE is the
+  relative path from proxy.py to the file that links your protected
+  files to the corresponding policy files governing
+  access. POLICY_TYPE is the MIME type of POLICY_FILE (‘text/rdf+n3′
+  or ‘application/rdf+xml’ most likely). LOG_FILE is the relative path
+  from proxy.py to the file to log access information to. The other
+  settings are not terribly relevant to FOAF+SSL and can be left
+  alone.
+
+5. Setup your policy file. Your policy file (at the path specified by
+   POLICY_FILE, defaulting to ‘./policies.n3′) is the key to
+   protecting your URIs with FOAF+SSL. The policy file is an RDF file
+   that links resources representing the protected URIs to their
+   corresponding policy files. This is most easily done with the
+   rein:access-policy
+   (http://dig.csail.mit.edu/2005/09/rein/network#access-policy)
+   property (subject to change in future TAAC releases). Here’s a very
+   simple policies.n3 that protects my_file.html:
+
+   @prefix rein: <http://dig.csail.mit.edu/2005/09/rein/network#> .
+   
+   <./my_file.html> rein:access-policy <./my_file.policy.n3> .
+
+6. Create a policy. The policy is the access-policy attached by
+   policies.n3. This policy is written in the AIR language, may be
+   somewhat daunting for someone trying to write their first policy. A
+   couple of sample policies include
+   http://www.pipian.com/rdf/tami/juliette.policy.n3#JulietteLocationDissemPolicy,
+   which permits any valid authentication via FOAF+SSL, and
+   http://www.pipian.com/rdf/tami/juliette.policy.n3#JulietteFOAFDissemPolicy,
+   which allows only friends and friends of friends of Juliette
+   access.
+
+   NOTE: The above policies may use outdated AIR syntax.  You will
+   need to use the version of the AIR language supported by the
+   version of the air-reasoner you copied.  You should probably take a
+   look at the example/ directory in the air-reasoner repository for
+   the general format of a rule.
+
+7. Create your log file with mode 0666. This is usually ‘log.n3′.
+
+8. Edit your .htaccess file. In order to actually enable the
+   protection, you need to create a .htaccess file that actually adds
+   proxy.py as a mod_python proxy and explicitly enables SSL client
+   certificates to be passed to
+   proxy.py. http://mr-burns.w3.org/taac/htaccess is a good example
+   for Apache 1.3 SSL servers. Apache 2.0′s mod_ssl requires somewhat
+   different flags to enable passing SSL client certificates (melvin
+   carvalho says that SSLOptions should be set to +StdEnvVars and
+   +ExportCertData).
+
+   NOTE: Make sure to update the PythonPath directive to include the
+   TAAC directory!
+
+9. TAAC should now be set up and running
